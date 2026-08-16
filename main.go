@@ -1,9 +1,20 @@
 // Command arms runs the ARMS online servers (auth + secure) on the Nextendo NEX
 // stack — a from-scratch NEX implementation with no third-party dependencies.
+// It runs the auth and secure servers in one process.
 //
 // Two NEX servers run in one process:
-//   - auth   (:443)   TicketGranting — LoginEx issues the Kerberos ticket.
-//   - secure (:60006) SecureConnection + matchmaking + NAT-traversal + ranking + utility.
+//   - auth   (:443)   TicketGranting — LoginEx issues the Kerberos ticket. ARMS links the
+//     TicketGranting client but which of LoginEx (0x2) / ValidateAndRequestTicketWithParam
+//     (0x6) it actually calls has NOT been observed; AuthConfig.Handler() answers both, so
+//     only the log line differs.
+//   - secure (:60006) SecureConnection + matchmaking + NAT traversal + Utility, plus a
+//     DataStore (0x73) stub the ARMS *update* exercises.
+//
+// ARMS links NEX 4.3.5 and Pia 5.7.0 (the base game: NEX 4.0.3 / Pia 5.2.12), so it
+// predates Switch Pia 5.19 and takes the legacy SecureConnection shape, like Splatoon 2.
+//
+// Every value that could not be confirmed on the wire is behind an env var (ARMS_*) so it
+// can be flipped without recompiling. See example.env and README.md.
 package main
 
 import (
@@ -22,38 +33,82 @@ import (
 )
 
 const (
-	accessKey     = "b6b34c51"
-	nexVersion    = 40000
+	// defaultAccessKey is ARMS's NEX access key (MK8 uses 09c1c475, S2 4eb18d39, SSBU
+	// 9587602b). Read out of the ARMS *update*'s main NSO .rodata at 0x42bda6 and confirmed
+	// three independent ways — see the "NEX access key" section of README.md. It is NOT a
+	// guess, but it stays overridable via ARMS_ACCESS_KEY because a wrong access key fails
+	// SILENTLY at SYN: the PRUDP-Lite packet signature simply does not match and the console
+	// retries forever with no error on either side.
+	defaultAccessKey = "b6b34c51"
+
+	// defaultNexVersion: the ARMS UPDATE links NEX 4.3.5 ("SDK MW+Nintendo+NEX-4_3_5-OL" in
+	// its .rodata); the base game links 4.0.3, i.e. 40003. The update is what runs, so 40305.
+	// nextendo-nex only branches on NexVersion at >=30500 and >=40000, so this behaves
+	// exactly like the 40000 the other three titles use — near-zero-risk either way.
+	defaultNexVersion = 40305
+
 	securePID     = 2
 	sessionKeyLen = 32
+
+	// armsTitleID is the base title; the update is 01009B500007C800. Kept here so the value
+	// has one home in the tree (nextendo-account keys its player counts off the access key).
+	armsTitleID = "01009b500007c000"
 )
 
-// securePassword: Kerberos password shared between auth and secure. Overridden by
-// NEXTENDO_SECURE_PASSWORD in prod; the default is only a dev placeholder.
-var securePassword = envOr("NEXTENDO_SECURE_PASSWORD", "securepasswordplz1")
-
 var (
+	// accessKey / nexVersion — see the const block above for provenance.
+	accessKey  = envOr("ARMS_ACCESS_KEY", defaultAccessKey)
+	nexVersion = envOrInt("ARMS_NEX_VERSION", defaultNexVersion)
+
+	// nextendoHost is the BARE IP the console will dial — NOT host:port. It is used only as
+	// the "address" param of the secure station URL; the port comes from SECURE_PORT.
 	nextendoHost = envOr("NEXTENDO_HOST", "127.0.0.1")
 	authPort     = envOrInt("AUTH_PORT", 443)
 	securePort   = envOrInt("SECURE_PORT", 60006)
-	certFile     = envOr("CERT_FILE", "cert.pem")
-	keyFile      = envOr("KEY_FILE", "key.pem")
 
-	// nextendoSecret signs "nx2." NEX login tokens issued by the account service. It
-	// MUST be byte-identical to nextendo-account's secret or token validation fails.
-	// Match its loadSecret exactly: env NEXTENDO_SECRET as raw bytes, else hex-decode
-	// the shared key file (the account has no env → it hex-decodes nextendo_secret.key).
+	securePassword = envOr("NEXTENDO_SECURE_PASSWORD", "securepasswordplz1")
+	certFile       = envOr("CERT_FILE", "cert.pem")
+	keyFile        = envOr("KEY_FILE", "key.pem")
+
+	// nextendoSecret signs "nx2." NEX login tokens issued by the account service. It MUST
+	// be byte-identical to nextendo-account's secret or token validation fails.
 	nextendoSecret = loadNextendoSecret()
-	// requireAccount, when "1", rejects any login without a valid Nextendo token,
-	// restricting the server to account holders.
+	// requireAccount, when "1", rejects any login without a valid Nextendo token.
 	requireAccount = os.Getenv("NEXTENDO_REQUIRE_ACCOUNT") == "1"
 )
+
+// --- Unverified wire-shape knobs. Defaults = the Splatoon 2 (pre-Pia-5.19) profile, which
+// --- is the era-matched one for ARMS. Each is an env var so a wrong guess costs a restart,
+// --- not a recompile. README.md documents the order to try them in.
+
+// stationScheme: "prudps" (PRUDP *Secure*) makes the console treat the secure server as
+// authenticated and hand over its Kerberos ticket in CONNECT. With "prudp" the handshake
+// completes but CONNECT carries an EMPTY payload — no ticket, no session key — and the title
+// dies the moment Pia needs the session (menus still look fine). S2 + SSBU need "prudps";
+// MK8 is the outlier that still uses "prudp".
+func stationScheme() string { return envOr("ARMS_STATION_SCHEME", "prudps") }
+
+// secureMinor: the PRUDP minor version the SECURE endpoint answers SYN with (the
+// supported-functions option encodes minorVersion|supportedFunc<<8). The retail secure server
+// answered 0 where nextendo-nex defaults to 5; with 5 the console sends CONNECT with plen=0
+// and never hands over the ticket. NEVER force this on the auth endpoint — SSBU's auth
+// stopped receiving logins entirely when that was done, which is why only the secure endpoint
+// gets its own Settings object below.
+func secureMinor() int { return envOrInt("ARMS_SECURE_MINOR", 0) }
+
+// legacyPia: ARMS ships Pia 5.7.0 (measured in the update's .rodata), well below the 5.19
+// that introduced the type=0x0B + Pa public-station shape at SecureConnection.Register. So we
+// default to the legacy type=0x03 / no-Pa answer, as Splatoon 2 does. Set ARMS_LEGACY_PIA=0
+// to send SSBU/MK8's Pia 5.19 shape instead.
+func legacyPia() bool { return envOr("ARMS_LEGACY_PIA", "1") != "0" }
 
 func main() {
 	settings := nex.NewSwitchSettings(accessKey, nexVersion)
 
-	// --- Auth server (insecure, :443) ---
-	secureURL := nex.NewStationURL("prudp")
+	// --- Auth server (:443) ---
+	// The scheme of this station URL is how the client decides the target is a secure server
+	// and therefore hands over its Kerberos ticket in CONNECT — see stationScheme() above.
+	secureURL := nex.NewStationURL(stationScheme())
 	secureURL.Set("address", nextendoHost)
 	secureURL.SetInt("port", securePort)
 	secureURL.SetInt("CID", 1)
@@ -77,21 +132,37 @@ func main() {
 	authServer := nex.NewServer(authEndpoint)
 
 	// --- Secure server (:60006) ---
-	secureEndpoint := nex.NewEndpoint(settings)
+	// Its OWN settings, scoped on purpose: the auth (:443) is a separate PRUDP server and
+	// must keep the default minor version. Cf. secureMinor().
+	secureSettings := nex.NewSwitchSettings(accessKey, nexVersion)
+	secureSettings.PrudpMinorVersion = secureMinor()
+	secureEndpoint := nex.NewEndpoint(secureSettings)
 	secureEndpoint.SetSecureAccount(securePassword, securePID)
 
 	mm := nex.NewMatchmaking()
-	secureEndpoint.Register(nex.ProtocolSecureConnection, nex.SecureConnectionHandler())
+
+	scCfg := nex.LegacyPiaConfig()
+	if !legacyPia() {
+		scCfg = nex.SwitchPia519Config()
+	}
+	secureEndpoint.Register(nex.ProtocolSecureConnection, nex.SecureConnectionHandlerWithConfig(scCfg))
 	secureEndpoint.Register(nex.ProtocolMatchmakeExtension, mm.ExtensionHandler())
 	secureEndpoint.Register(nex.ProtocolMatchMaking, mm.MatchMakingHandler())
 	secureEndpoint.Register(nex.ProtocolMatchMakingExt, mm.MatchMakingExtHandler())
 	secureEndpoint.Register(nex.ProtocolNATTraversal, nex.NATTraversalHandler())
-	secureEndpoint.Register(nex.ProtocolRanking, nex.RankingHandler())
 	secureEndpoint.Register(nex.ProtocolUtility, nex.UtilityHandler())
+	// Ranking (0x70) is registered although no RankingProtocolClient is linked in EITHER ARMS
+	// build (the "Ranking::*" strings in the binary are just NEX error-name table entries).
+	// It is three lines and harmless — do not read anything into it never being called.
+	secureEndpoint.Register(nex.ProtocolRanking, nex.RankingHandler())
+	// ARMS-specific: the DataStore (0x73) stub the update needs, and the Pia keepalive.
+	setupARMSStubs(secureEndpoint)
+
 	logSecure := logRMC("Secure")
 	secureEndpoint.OnRMC = func(c *nex.Connection, req *nex.RMCMessage) {
 		logSecure(c, req)
-		noteRMC(c, req) // feed the monitoring dashboard
+		noteRMC(c, req)         // feed the monitoring dashboard
+		notePresenceSeen(c.PID) // any packet from a PID = that account is playing ARMS now
 	}
 	secureEndpoint.OnConnect = func(c *nex.Connection) {
 		fmt.Printf("[ARMS Secure] connected pid=%d id=%d addr=%s\n", c.PID, c.ID, c.RemoteAddr)
@@ -104,13 +175,13 @@ func main() {
 	}
 	secureServer := nex.NewServer(secureEndpoint)
 
-	// Monitoring: per-game /api/stats for the unified Nextendo dashboard.
+	// Éviction automatique des connexions mortes + monitoring /api/stats.
 	secureEndpoint.StartReaper()
 	go startDashboard(secureEndpoint, mm)
+	startPresenceReporter()
 
-	// When the auth is fronted by a TLS-passthrough proxy, enable PROXY protocol so the
-	// auth sees the console's REAL IP (see mk8's main.go for why this matters for PID
-	// recall on the ticketless secure CONNECT).
+	// When the auth is fronted by a TLS-passthrough proxy (Traefik on the shared :443),
+	// enable PROXY protocol so the auth sees the console's REAL IP. Not used locally.
 	proxyProto := os.Getenv("NEXTENDO_PROXY_PROTOCOL") == "1"
 	go func() {
 		fmt.Printf("[ARMS Auth] listening WSS :%d (proxyProto=%v, secure URL -> %s)\n", authPort, proxyProto, secureURL.String())
@@ -125,46 +196,56 @@ func main() {
 		}
 	}()
 
-	fmt.Printf("[ARMS Secure] listening WSS :%d\n", securePort)
+	fmt.Printf("[ARMS Secure] listening WSS :%d (accessKey=%s nexVersion=%d scheme=%s minor=%d legacyPia=%v title=%s)\n",
+		securePort, accessKey, nexVersion, stationScheme(), secureMinor(), legacyPia(), armsTitleID)
 	if err := secureServer.ListenSecure(securePort, certFile, keyFile); err != nil {
 		fmt.Printf("[ARMS Secure] stopped: %v\n", err)
 	}
 }
 
-// resolveUser maps a LoginEx username to an account. A valid "nx2." Nextendo
-// token resolves to its persistent PID; anything else gets a stable anonymous
-// PID derived from the username (so the same console keeps the same identity).
+// resolveUser maps a LoginEx username to an account. A valid "nx2." Nextendo token
+// resolves to its persistent PID; anything else gets a stable anonymous PID derived from
+// the username (so the same console keeps the same identity).
+//
+// For a LOCAL test: Citron sends the bare decimal PID from config/nextendo_account.txt
+// (e.g. 1800003542). That is >= 1800000000 and < 1810000000, so branch 2 takes it verbatim,
+// resolveNSAtoPID (the only FAIL-CLOSED path) is never reached, and the single account call
+// nextendoOnlineCheck fails OPEN on any transport error — no account server required.
 func resolveUser(username string, _ []byte) (uint64, []byte, bool) {
-	// The source key encrypts the client ticket and is handed back as pSourceKey,
-	// so the console decrypts it. It MUST be 32 bytes (the Switch kerberos key
-	// size) — a 16-byte key makes the console reject the ticket. Derive it
-	// deterministically per user.
+	// The source key encrypts the client ticket and is handed back as pSourceKey, so the
+	// console decrypts it. It MUST be 32 bytes (the Switch kerberos key size).
 	sk := sha256.Sum256([]byte("nextendo-src:" + username))
 	sourceKey := sk[:]
 
 	// 1. Signed nx2 token → the account's PERSISTENT PID (+ online gates).
 	if pid, ok := nextendoPIDFromToken(username); ok {
 		if allow, reason := nextendoOnlineCheck(pid, "ryujinx"); !allow {
-			fmt.Printf("[Auth] pid=%d online REFUSED (%s)\n", pid, reason)
+			fmt.Printf("[Auth] pid=%d online REFUSÉ (%s)\n", pid, reason)
 			return 0, nil, false
 		}
 		return pid, sourceKey, true
 	}
 
-	// 2. Numeric username. The emulator's "Connexion Nextendo" button sends the
-	// account's OWN PID (a bare number in the Nextendo range) as the username; a REAL
-	// CFW Switch sends its console baasUserID (a large NSA id) instead, which we must
-	// resolve to the account PID. Using the account PID verbatim keeps the NEX identity
-	// = the account the game knows itself by (hashing it breaks Pia's self-recognition
-	// → 2618-562 SessionKeepFailed).
+	// 2. Numeric username. The emulator's "Connexion Nextendo" button sends the account's
+	// OWN PID; a real CFW Switch sends its console baasUserID (a large NSA id) instead,
+	// which we resolve to the account PID. Using the account PID verbatim keeps the NEX
+	// identity = the account the game knows itself by (hashing it breaks Pia's
+	// self-recognition → 2618-562 SessionKeepFailed).
 	if n, err := strconv.ParseUint(username, 10, 64); err == nil && n >= 1800000000 {
+		// FAILLE D AUTHENTIFICATION CONNUE. Ce chemin accepte un PID NU comme identite :
+		// aucun jeton, aucune signature. Les PID etant sequentiels depuis 1800000001, il
+		// suffit d envoyer le numero d un autre membre pour jouer sous son identite — et,
+		// via la garde « un seul endroit », l empecher lui-meme de jouer.
+		// On ne peut pas l interdire sechement : l emulateur distribue envoie precisement
+		// ce PID nu. Le refus est donc derriere un interrupteur, a activer quand une build
+		// envoyant le jeton nx2 signe sera deployee. En attendant on journalise chaque usage.
 		if requireSignedToken() {
-			fmt.Printf("[Auth] pid=%d REFUSED: bare-PID identity disabled (signed nx2 token required)\n", n)
+			fmt.Printf("[Auth] pid=%d REFUSE : identite par PID nu desactivee (jeton nx2 signe requis)\n", n)
 			return 0, nil, false
 		}
-		fmt.Printf("[Auth] pid=%d bare-PID identity (unauthenticated — see NEXTENDO_REQUIRE_SIGNED_TOKEN)\n", n)
+		fmt.Printf("[Auth] pid=%d identite par PID NU (non authentifiee — cf. NEXTENDO_REQUIRE_SIGNED_TOKEN)\n", n)
 		pid, kind := n, "ryujinx"
-		if n >= 1810000000 { // real Switch: NSA id -> account PID (online = Nextendo accounts ONLY)
+		if n >= 1810000000 { // vraie Switch : NSA id -> PID de compte (online = comptes Nextendo UNIQUEMENT)
 			kind = "switch"
 			rp, st := resolveNSAtoPID(n)
 			switch st {
@@ -172,31 +253,32 @@ func resolveUser(username string, _ []byte) (uint64, []byte, bool) {
 				pid = rp
 				fmt.Printf("[Auth] NSA %d -> account pid=%d\n", n, pid)
 			case nsaUnknown:
-				fmt.Printf("[Auth] NSA %d REFUSED (no Nextendo account)\n", n)
+				fmt.Printf("[Auth] NSA %d REFUSÉ (aucun compte Nextendo)\n", n)
 				return 0, nil, false
 			case nsaUnreachable:
-				fmt.Printf("[Auth] NSA %d REFUSED (account server unreachable)\n", n)
+				fmt.Printf("[Auth] NSA %d REFUSÉ (serveur compte injoignable)\n", n)
 				return 0, nil, false
 			}
 		}
+		// GATES online : #6 e-mail vérifié + #5 un seul endroit + compte inconnu/désactivé.
 		if allow, reason := nextendoOnlineCheck(pid, kind); !allow {
-			fmt.Printf("[Auth] pid=%d online REFUSED (%s)\n", pid, reason)
+			fmt.Printf("[Auth] pid=%d online REFUSÉ (%s)\n", pid, reason)
 			return 0, nil, false
 		}
 		return pid, sourceKey, true
 	}
 
-	// 3. Anonymous / no Nextendo identity. When requireAccount is on, online REQUIRES
-	// a Nextendo account → reject (the game can't enter online mode).
+	// 3. Anonymous / no Nextendo identity. When requireAccount is on, online REQUIRES a
+	// Nextendo account → reject (the game can't enter online mode).
 	if requireAccount {
-		fmt.Printf("[Auth] anonymous login REFUSED (Nextendo account required): %q\n", username)
+		fmt.Printf("[Auth] login anonyme REFUSÉ (compte Nextendo requis): %q\n", username)
 		return 0, nil, false
 	}
 	return anonymousPID(username), sourceKey, true
 }
 
-// nextendoPIDFromToken validates a "nx2.<b64(pid.username.expiry)>.<b64(hmac)>"
-// token signed by the account service (HMAC-SHA256, "nex:" prefix).
+// nextendoPIDFromToken validates a "nx2.<b64(pid.username.expiry)>.<b64(hmac)>" token
+// signed by the account service (HMAC-SHA256, "nex:" prefix).
 func nextendoPIDFromToken(s string) (uint64, bool) {
 	if len(nextendoSecret) == 0 || !strings.HasPrefix(s, "nx2.") {
 		return 0, false
@@ -231,9 +313,8 @@ func nextendoPIDFromToken(s string) (uint64, bool) {
 
 // loadNextendoSecret loads the shared NEX-token signing secret the SAME way
 // nextendo-account does (its loadSecret): env NEXTENDO_SECRET as raw bytes if set,
-// otherwise hex-decode the shared key file (NEXTENDO_SECRET_FILE, default
-// nextendo_secret.key). The deployed account has no env → it hex-decodes the file,
-// so the game server must too or the HMAC won't match and every nx2 token is rejected.
+// otherwise hex-decode the shared key file. The deployed account has no env → it
+// hex-decodes the file, so we must too or the HMAC won't match.
 func loadNextendoSecret() []byte {
 	if v := os.Getenv("NEXTENDO_SECRET"); v != "" {
 		return []byte(v)
@@ -276,9 +357,9 @@ func envOrInt(key string, def int) int {
 	return def
 }
 
-// requireSignedToken: when true, only an identity proven by a SIGNED nx2 token is
-// accepted at LoginEx; a bare PID is rejected. Off by default, matching the other
-// game servers, until a build sending the signed nx2 token is what's deployed.
+// requireSignedToken : quand true, seule une identite prouvee par un jeton nx2 SIGNE est
+// acceptee au LoginEx ; un PID nu est refuse. Desactive par defaut car l emulateur
+// actuellement distribue envoie encore le PID nu — a activer apres la prochaine release.
 func requireSignedToken() bool {
 	v := os.Getenv("NEXTENDO_REQUIRE_SIGNED_TOKEN")
 	return v == "1" || v == "true"

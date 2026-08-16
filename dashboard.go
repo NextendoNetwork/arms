@@ -88,15 +88,17 @@ func noteRMC(c *nex.Connection, req *nex.RMCMessage) {
 	eventsMu.Unlock()
 }
 
-// gameModeName maps ARMS' MatchmakeSession game_mode -> a human label.
+// gameModeName maps MK8 online MatchmakeSession game_mode -> a human label.
 func gameModeName(mode uint32) string {
 	switch mode {
 	case 1:
-		return "Ranked Match"
+		return "Course"
 	case 2:
-		return "Party Match"
+		return "Course (équipe)"
 	case 3:
-		return "Friendly Match"
+		return "Bataille"
+	case 4:
+		return "Bataille (équipe)"
 	default:
 		return fmt.Sprintf("Mode %d", mode)
 	}
@@ -107,6 +109,7 @@ func rmcName(proto uint16, method uint32) string {
 		0x0A: "TicketGranting", 0x0B: "SecureConnection", 0x6E: "Utility",
 		0x70: "Ranking", 0x6D: "MatchmakeExt", 0x15: "MatchMaking",
 		0x32: "MatchMakingExt", 0x03: "NATTraversal", 0x0E: "Notifications",
+		0x73: "DataStore", // stubbed for ARMS — see arms_stubs.go
 	}[proto]
 	if pn == "" {
 		pn = fmt.Sprintf("Proto-0x%X", proto)
@@ -218,6 +221,12 @@ type apiStats struct {
 }
 
 func dispName(pid uint64) string { return fmt.Sprintf("Joueur-%d", pid%100000) }
+
+// nexVersionString renders the packed nexVersion (major*10000 + minor*100 + patch) as the
+// dotted form the dashboard aggregator displays: 40305 -> "4.3.5".
+func nexVersionString() string {
+	return fmt.Sprintf("%d.%d.%d", nexVersion/10000, (nexVersion/100)%100, nexVersion%100)
+}
 
 func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 	conns := endpoint.SnapshotConnections()
@@ -343,7 +352,10 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 		GatheringsMade: int64(len(gs)),
 		PeakConnected:  peakConnected,
 		Server: apiServer{
-			AccessKey: accessKey, NexVersion: "4.0.0", AuthPort: fmt.Sprintf("%d", authPort),
+			// NexVersion is derived from the runtime nexVersion (40305 -> "4.3.5") rather than
+			// hardcoded as the sibling repos do, because ARMS's is overridable (ARMS_NEX_VERSION)
+			// and /api/stats should report what is actually on the wire.
+			AccessKey: accessKey, NexVersion: nexVersionString(), AuthPort: fmt.Sprintf("%d", authPort),
 			SecurePort: securePort, SNIHost: envOr("NEXTENDO_SNI_HOST", ""), SessionKey: sessionKeyLen,
 			Stack: "nextendo-nex",
 		},
