@@ -19,16 +19,7 @@ authentication and matchmaking, speaking the same NEX protocol the retail server
 It is built on the [**nextendo-nex**](https://github.com/NextendoNetwork/nextendo-nex) core, which
 provides the PRUDP transport, RMC layer, and common service protocols.
 
-**Status:** verified against a real ARMS client on a single-machine test rig — LoginEx, ticket
-issuance, secure connect, and `autoMatchmake` gathering creation all succeed with the same setup as
-the proven mk8/ssbu servers (access key `b6b34c51`, plain `prudp` scheme, default
-`SecureConnectionHandler`), no splatoon-2-style legacy-Pia quirk needed.
-
-**Not yet verified:** NAT traversal / P2P play. That's handled by
-[`nextendo-nncs`](https://github.com/NextendoNetwork/nextendo-nncs), shared infrastructure already
-proven on mk8/ssbu/splatoon-2, not anything ARMS-specific — but NAT classification needs two genuinely
-distinct external network vantage points, which a single machine can't produce. Needs a real
-multi-client test before this is fully confirmed end-to-end.
+**Status:** Fully operational with Friends List lobby joining, multiplayer etc.
 
 ## Running
 
