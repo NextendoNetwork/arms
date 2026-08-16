@@ -19,12 +19,7 @@ authentication and matchmaking, speaking the same NEX protocol the retail server
 It is built on the [**nextendo-nex**](https://github.com/NextendoNetwork/nextendo-nex) core, which
 provides the PRUDP transport, RMC layer, and common service protocols.
 
-**Status:** verified against a real ARMS client on a VPS test rig — LoginEx, ticket
-issuance, secure connect, and `autoMatchmake` gathering creation all succeed with the same setup as
-the proven mk8/ssbu servers (access key `b6b34c51`, plain `prudp` scheme, default
-`SecureConnectionHandler`)
-
-**Not yet verified:** Friends List Lobby Joining/Hosting. Otherwise, standard Party Battle works.
+**Status:** Fully operational with Friends List lobby joining, multiplayer etc.
 
 ## Running
 
